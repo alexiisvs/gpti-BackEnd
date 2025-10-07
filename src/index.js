@@ -1,35 +1,67 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const morgan = require('morgan');
+// ================================
+//  BACKEND GPTI - TTS Google (gTTS)
+// ================================
+
+const express = require("express");
+const cors = require("cors");
+const morgan = require("morgan");
+const fs = require("fs");
+const gTTS = require("gtts"); // 👈 Librería Google TTS
+require("dotenv").config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Middlewares
 app.use(cors());
 app.use(express.json());
-app.use(morgan('dev'));
+app.use(morgan("dev"));
 
+// ================================
+//  RUTA: Generar audio desde texto
+// ================================
+app.post("/api/v1/tts/speak", async (req, res) => {
+  try {
+    const text = (req.body?.text ?? "").trim();
 
-// ✅ Nuevo: valida texto
-app.post('/api/v1/tts/check', (req, res) => {
-  const text = (req.body?.text ?? '').toString();
-  const isEmpty = text.trim().length === 0;
+    if (!text) {
+      return res.status(400).json({ error: "Texto vacío" });
+    }
 
-  if (isEmpty) {
-    return res.json({ status: 'empty' });
+    // Crear archivo temporal
+    const tts = new gTTS(text, "es"); // Idioma español
+    const filePath = `tts_${Date.now()}.mp3`;
+
+    // Guardar y enviar
+    tts.save(filePath, (err) => {
+      if (err) {
+        console.error("Error generando audio:", err);
+        return res.status(500).json({ error: "Error generando audio" });
+      }
+
+      // Configurar respuesta
+      res.setHeader("Content-Type", "audio/mpeg");
+
+      // Enviar el audio como stream
+      const stream = fs.createReadStream(filePath);
+      stream.pipe(res);
+
+      // Borrar archivo temporal cuando termine
+      stream.on("close", () => {
+        fs.unlink(filePath, (unlinkErr) => {
+          if (unlinkErr) console.error("Error borrando archivo temporal:", unlinkErr);
+        });
+      });
+    });
+  } catch (err) {
+    console.error("Error general en TTS:", err);
+    res.status(500).json({ error: "Error procesando la solicitud TTS" });
   }
-  return res.json({ status: 'ok' });
 });
 
-// Demo existente
-app.get('/api/v1/hello', (_req, res) => {
-  res.json({ message: 'Hola desde GPTI Backend ⚙️' });
-});
-
+// ================================
+//  INICIO DEL SERVIDOR
+// ================================
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ Servidor corriendo en http://localhost:${PORT}`);
+  console.log(`✅ Back en http://localhost:${PORT}`);
 });
 
 
