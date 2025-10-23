@@ -1,8 +1,12 @@
+// src/routes/llm.routes.js
 const { Router } = require("express");
-const { runDemoChat } = require("../controllers/llm.controller");
+const { analyze, chatLLM } = require("../controllers/llm.controller");
 
 const router = Router();
 
-router.post("/chat", runDemoChat);
+// - analyze: para demo con instruction + text
+// - chat: para flujos con messages (opcional ahora, útil después)
+router.post("/analyze", analyze);
+router.post("/chat", chatLLM);
 
 module.exports = router;
