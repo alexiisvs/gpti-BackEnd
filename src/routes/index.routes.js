@@ -8,5 +8,6 @@ const router = Router();
 router.use("/tts", ttsRoutes);
 router.use("/pdf", pdfRoutes);
 router.use("/llm", llmRoutes);
+router.use("/pdf", pdfRoutes);
 
 module.exports = router;
