@@ -440,10 +440,10 @@ app.post('/api/v1/chat', async (req, res) => {
   }
 });
 
-// ✅ Endpoint TTS: Generar audio desde texto
+// ✅ Endpoint TTS: Generar audio desde texto usando gTTS
 app.post('/api/v1/tts/speak', async (req, res) => {
   try {
-    const { text } = req.body;
+    const { text, lang = 'es' } = req.body;
 
     if (!text || text.trim().length === 0) {
       return res.status(400).json({
@@ -452,17 +452,83 @@ app.post('/api/v1/tts/speak', async (req, res) => {
       });
     }
 
-    // En producción, aquí se integraría con un servicio TTS real (Google Cloud TTS, AWS Polly, etc.)
-    // Por ahora, retornamos un mensaje de éxito (el frontend puede simular el audio)
-    // O podrías usar un servicio TTS gratuito como gTTS
+    // Limitar el texto a 5000 caracteres por solicitud (límite de gTTS)
+    const textToConvert = text.substring(0, 5000);
     
-    // Simulación: retornar un mensaje indicando que el audio se generó
-    // En producción, aquí generarías el audio y lo retornarías como blob
+    const gtts = require('gtts');
+    const path = require('path');
+    const audioDir = path.join(__dirname, '../audio');
     
-    res.json({
-      success: true,
-      message: 'Audio generado exitosamente',
-      textLength: text.length
+    // Crear directorio de audio si no existe
+    if (!fs.existsSync(audioDir)) {
+      fs.mkdirSync(audioDir, { recursive: true });
+    }
+    
+    // Generar nombre único para el archivo de audio
+    const audioId = `audio-${Date.now()}-${Math.round(Math.random() * 1E9)}`;
+    const audioPath = path.join(audioDir, `${audioId}.mp3`);
+    
+    // Generar audio usando gTTS
+    const tts = new gtts(textToConvert, lang);
+    
+    return new Promise((resolve, reject) => {
+      tts.save(audioPath, async (err) => {
+        if (err) {
+          console.error('Error al generar audio con gTTS:', err);
+          return res.status(500).json({
+            success: false,
+            message: 'Error al generar el audio: ' + err.message
+          });
+        }
+        
+        // Verificar que el archivo se creó correctamente
+        if (!fs.existsSync(audioPath)) {
+          console.error('El archivo de audio no se creó');
+          return res.status(500).json({
+            success: false,
+            message: 'Error: El archivo de audio no se generó correctamente'
+          });
+        }
+        
+        try {
+          // Leer el archivo y enviarlo como respuesta
+          const audioBuffer = fs.readFileSync(audioPath);
+          
+          if (audioBuffer.length === 0) {
+            console.error('El archivo de audio está vacío');
+            return res.status(500).json({
+              success: false,
+              message: 'Error: El archivo de audio está vacío'
+            });
+          }
+          
+          console.log(`Audio generado exitosamente: ${audioBuffer.length} bytes`);
+          
+          // Configurar headers para streaming de audio
+          res.setHeader('Content-Type', 'audio/mpeg');
+          res.setHeader('Content-Length', audioBuffer.length);
+          res.setHeader('Content-Disposition', `inline; filename="${audioId}.mp3"`);
+          res.setHeader('Cache-Control', 'no-cache');
+          
+          // Enviar el audio
+          res.send(audioBuffer);
+          
+          // Eliminar el archivo después de enviarlo (opcional, para ahorrar espacio)
+          setTimeout(() => {
+            if (fs.existsSync(audioPath)) {
+              fs.unlinkSync(audioPath);
+            }
+          }, 60000); // Eliminar después de 1 minuto
+          
+          resolve();
+        } catch (readError) {
+          console.error('Error al leer el archivo de audio:', readError);
+          res.status(500).json({
+            success: false,
+            message: 'Error al leer el archivo de audio: ' + readError.message
+          });
+        }
+      });
     });
   } catch (error) {
     console.error('Error en TTS:', error);
