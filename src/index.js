@@ -15,7 +15,10 @@ const PORT = process.env.PORT || 3000;
 
 // ✅ Configuración de Gemini Pro
 let geminiClient = null;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyBYoxKvfI_ThVr8wO8Sb9dTeIAT4eECJJE';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+if (!GEMINI_API_KEY) {
+  console.warn('⚠️ GEMINI_API_KEY no está configurada en las variables de entorno');
+}
 if (GEMINI_API_KEY) {
   try {
     geminiClient = new GoogleGenerativeAI(GEMINI_API_KEY);

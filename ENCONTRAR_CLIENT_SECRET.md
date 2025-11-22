@@ -9,7 +9,7 @@
    - En el menú lateral, ve a "APIs & Services" > "Credentials"
 
 3. **Busca tu OAuth 2.0 Client ID:**
-   - Deberías ver una lista con tu Client ID: `891464775316-5h8ducclu0bi5279obbp5hbtpd7g5j1e.apps.googleusercontent.com`
+   - Deberías ver una lista con tu Client ID (algo como `xxxxx-xxxxx.apps.googleusercontent.com`)
    - Haz clic en el nombre del OAuth client ID (o en el ícono de lápiz para editarlo)
 
 4. **Ver el Client Secret:**
