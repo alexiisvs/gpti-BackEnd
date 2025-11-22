@@ -27,7 +27,7 @@ if (GEMINI_API_KEY) {
 }
 
 // ✅ Función helper para generar contenido con Gemini Pro con timeout
-async function generateWithGemini(prompt, maxTokens = 2000, timeoutMs = 30000) {
+async function generateWithGemini(prompt, maxTokens = 2000, timeoutMs = 30000, modelName = 'gemini-2.5-flash') {
   if (!geminiClient) {
     return null; // Retornar null si Gemini no está configurado
   }
@@ -39,11 +39,11 @@ async function generateWithGemini(prompt, maxTokens = 2000, timeoutMs = 30000) {
 
   const generatePromise = async () => {
     try {
-      console.log(`🔄 Iniciando generación con Gemini (timeout: ${timeoutMs}ms)...`);
+      console.log(`🔄 Iniciando generación con Gemini (modelo: ${modelName}, timeout: ${timeoutMs}ms)...`);
       const startTime = Date.now();
       
-      // Usar el modelo gemini-2.5-flash (más rápido y eficiente)
-      const model = geminiClient.getGenerativeModel({ model: 'gemini-2.5-flash' });
+      // Usar el modelo especificado (por defecto gemini-2.5-flash)
+      const model = geminiClient.getGenerativeModel({ model: modelName });
       const result = await model.generateContent(prompt);
       const response = await result.response;
       const text = response.text();
@@ -54,16 +54,20 @@ async function generateWithGemini(prompt, maxTokens = 2000, timeoutMs = 30000) {
       return text;
     } catch (error) {
       console.error('Error al generar con Gemini Pro:', error.message);
-      // Si falla con gemini-2.5-flash, intentar con gemini-pro como fallback
-      try {
-        console.log('⚠️ Intentando con gemini-pro como fallback...');
-        const fallbackModel = geminiClient.getGenerativeModel({ model: 'gemini-pro' });
-        const result = await fallbackModel.generateContent(prompt);
-        const response = await result.response;
-        return response.text();
-      } catch (fallbackError) {
-        console.error('Error con fallback gemini-pro:', fallbackError.message);
-        throw fallbackError;
+      // Si falla con el modelo especificado, intentar con gemini-pro como fallback
+      if (modelName !== 'gemini-pro') {
+        try {
+          console.log('⚠️ Intentando con gemini-pro como fallback...');
+          const fallbackModel = geminiClient.getGenerativeModel({ model: 'gemini-pro' });
+          const result = await fallbackModel.generateContent(prompt);
+          const response = await result.response;
+          return response.text();
+        } catch (fallbackError) {
+          console.error('Error con fallback gemini-pro:', fallbackError.message);
+          throw fallbackError;
+        }
+      } else {
+        throw error;
       }
     }
   };
@@ -940,7 +944,7 @@ app.get('/api/v1/documents/:id/text', (req, res) => {
 app.post('/api/v1/documents/:id/chat', async (req, res) => {
   try {
     const { id } = req.params;
-    const { message, conversationHistory = [] } = req.body;
+    const { message, conversationHistory = [], model = 'gemini-2.5-flash' } = req.body;
     const document = documentsStore.get(id);
 
     if (!document) {
@@ -1000,10 +1004,10 @@ Pregunta del usuario: ${message}
 
 Respuesta:`;
 
-        const geminiResponse = await generateWithGemini(prompt, 2000, 60000);
+        const geminiResponse = await generateWithGemini(prompt, 2000, 60000, model);
         if (geminiResponse) {
           response = geminiResponse.trim();
-          console.log('✅ Respuesta generada con Gemini Pro');
+          console.log(`✅ Respuesta generada con Gemini Pro (modelo: ${model})`);
         } else {
           throw new Error('Gemini no generó respuesta');
         }
