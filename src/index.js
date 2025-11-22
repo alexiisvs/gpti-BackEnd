@@ -8,6 +8,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const pdfParse = require('pdf-parse');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { google } = require('googleapis');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -142,41 +143,59 @@ const TEST_USERS = [
 
 // ✅ Endpoint de login
 app.post('/api/v1/auth/login', (req, res) => {
-  const { email, password } = req.body;
+  try {
+    const { email, password } = req.body;
 
-  // Validación básica
-  if (!email || !password) {
-    return res.status(400).json({
+    // Validación básica
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email y contraseña son requeridos'
+      });
+    }
+
+    // Buscar usuario
+    const user = TEST_USERS.find(
+      u => u.email.toLowerCase() === email.toLowerCase() && u.password === password
+    );
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Credenciales inválidas'
+      });
+    }
+
+    // Login exitoso - retornar datos del usuario (sin la contraseña)
+    const { password: _, ...userWithoutPassword } = user;
+    
+    res.json({
+      success: true,
+      message: 'Login exitoso',
+      user: userWithoutPassword,
+      token: `mock-token-${user.id}-${Date.now()}` // Token simple para desarrollo
+    });
+  } catch (error) {
+    console.error('Error en endpoint de login:', error);
+    res.status(500).json({
       success: false,
-      message: 'Email y contraseña son requeridos'
+      message: 'Error interno del servidor al procesar el login'
     });
   }
-
-  // Buscar usuario
-  const user = TEST_USERS.find(
-    u => u.email.toLowerCase() === email.toLowerCase() && u.password === password
-  );
-
-  if (!user) {
-    return res.status(401).json({
-      success: false,
-      message: 'Credenciales inválidas'
-    });
-  }
-
-  // Login exitoso - retornar datos del usuario (sin la contraseña)
-  const { password: _, ...userWithoutPassword } = user;
-  
-  res.json({
-    success: true,
-    message: 'Login exitoso',
-    user: userWithoutPassword,
-    token: `mock-token-${user.id}-${Date.now()}` // Token simple para desarrollo
-  });
 });
 
 // Almacenamiento en memoria de documentos procesados (en producción usar BD)
 const documentsStore = new Map();
+
+// ✅ Configuración de Google Calendar API
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/api/v1/calendar/oauth2callback'
+);
+
+// Almacenar tokens de usuarios (en producción usar base de datos)
+const userTokens = new Map();
 
 // ✅ Middleware de manejo de errores de multer
 const handleMulterError = (err, req, res, next) => {
@@ -299,6 +318,65 @@ app.get('/api/v1/documents', (req, res) => {
     res.status(500).json({
       success: false,
       message: error.message || 'Error al obtener los documentos'
+    });
+  }
+});
+
+// ✅ Endpoint para sincronizar documento desde localStorage al backend
+app.post('/api/v1/documents/sync', (req, res) => {
+  try {
+    const { id, filename, text, createdAt } = req.body;
+
+    if (!id || !filename || !text) {
+      return res.status(400).json({
+        success: false,
+        message: 'ID, filename y text son requeridos'
+      });
+    }
+
+    // Verificar autenticación
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        success: false,
+        message: 'No autorizado. Token requerido.'
+      });
+    }
+
+    // Crear o actualizar el documento en el store
+    const documentInfo = {
+      id: id,
+      filename: filename,
+      text: text,
+      pages: 0, // No tenemos información de páginas
+      size: text.length,
+      createdAt: createdAt || new Date().toISOString(),
+      status: 'processed',
+      pills: {
+        microSummary: null,
+        flashcards: [],
+        highlightConcepts: [],
+        savedPills: []
+      }
+    };
+
+    documentsStore.set(id, documentInfo);
+    console.log(`✅ Documento sincronizado: ${id} (${filename})`);
+
+    res.json({
+      success: true,
+      message: 'Documento sincronizado exitosamente',
+      document: {
+        id: documentInfo.id,
+        filename: documentInfo.filename,
+        textLength: documentInfo.text.length
+      }
+    });
+  } catch (error) {
+    console.error('Error al sincronizar documento:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Error al sincronizar el documento'
     });
   }
 });
@@ -1419,6 +1497,507 @@ app.use((err, req, res, next) => {
     success: false,
     message: err.message || 'Error interno del servidor'
   });
+});
+
+// ✅ Endpoints de Google Calendar
+// Obtener URL de autenticación
+app.get('/api/v1/calendar/auth', (req, res) => {
+  try {
+    // Incluir scope de userinfo para poder obtener el email del usuario
+    const scopes = [
+      'https://www.googleapis.com/auth/calendar',
+      'https://www.googleapis.com/auth/userinfo.email'
+    ];
+    const authUrl = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: scopes,
+      prompt: 'consent'
+    });
+    res.json({ success: true, authUrl });
+  } catch (error) {
+    console.error('Error al generar URL de autenticación:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Callback de OAuth2
+app.get('/api/v1/calendar/oauth2callback', async (req, res) => {
+  try {
+    const { code } = req.query;
+    if (!code) {
+      return res.status(400).json({ success: false, message: 'Código de autorización no proporcionado' });
+    }
+
+    console.log('🔄 Intercambiando código por tokens...');
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+    
+    console.log('✅ Tokens obtenidos, intentando obtener información del usuario...');
+    
+    // Intentar obtener información del usuario, pero si falla, usar un ID temporal
+    let userId = 'user-' + Date.now();
+    try {
+      const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+      const userInfo = await oauth2.userinfo.get();
+      userId = userInfo.data.email || userInfo.data.id || userId;
+      console.log('✅ Información del usuario obtenida:', userId);
+    } catch (userInfoError) {
+      console.warn('⚠️ No se pudo obtener información del usuario, usando ID temporal:', userInfoError.message);
+      // Si no podemos obtener el email, usamos un ID temporal basado en el token
+      userId = tokens.access_token ? `user-${tokens.access_token.substring(0, 20)}` : userId;
+    }
+    
+    // Guardar tokens (en producción usar base de datos)
+    userTokens.set(userId, tokens);
+    console.log('✅ Tokens guardados para usuario:', userId);
+    console.log('📋 Token info:', {
+      hasAccessToken: !!tokens.access_token,
+      hasRefreshToken: !!tokens.refresh_token,
+      expiryDate: tokens.expiry_date ? new Date(tokens.expiry_date).toISOString() : 'N/A'
+    });
+    
+    // Redirigir al frontend con el token
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    res.redirect(`${frontendUrl}/dashboard/calendar-success?userId=${encodeURIComponent(userId)}`);
+  } catch (error) {
+    console.error('❌ Error en callback de OAuth2:', error);
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    res.redirect(`${frontendUrl}/dashboard/calendar-error?error=${encodeURIComponent(error.message)}`);
+  }
+});
+
+// Crear evento recurrente en Google Calendar
+app.post('/api/v1/calendar/create-event', async (req, res) => {
+  try {
+    const { userId, documentId, documentName, daysOfWeek, time, durationWeeks = 52, timezone = 'America/Santiago' } = req.body;
+
+    if (!userId || !documentId || !documentName || !daysOfWeek || !Array.isArray(daysOfWeek) || daysOfWeek.length === 0 || !time) {
+      return res.status(400).json({
+        success: false,
+        message: 'userId, documentId, documentName, daysOfWeek (array), y time son requeridos'
+      });
+    }
+
+    // Obtener tokens del usuario
+    const tokens = userTokens.get(userId);
+    console.log('🔍 Buscando tokens para userId:', userId, 'Encontrados:', !!tokens);
+    
+    if (!tokens) {
+      console.error('❌ No se encontraron tokens para userId:', userId);
+      console.log('📋 Usuarios con tokens guardados:', Array.from(userTokens.keys()));
+      return res.status(401).json({
+        success: false,
+        message: 'Usuario no autenticado. Por favor, autoriza el acceso a Google Calendar primero.'
+      });
+    }
+
+    // Verificar si el token está expirado y refrescarlo si es necesario
+    if (tokens.expiry_date && Date.now() >= tokens.expiry_date) {
+      console.log('🔄 Token expirado, refrescando...');
+      try {
+        oauth2Client.setCredentials(tokens);
+        const { credentials } = await oauth2Client.refreshAccessToken();
+        tokens.access_token = credentials.access_token;
+        tokens.expiry_date = credentials.expiry_date;
+        userTokens.set(userId, tokens);
+        console.log('✅ Token refrescado exitosamente');
+      } catch (refreshError) {
+        console.error('❌ Error al refrescar token:', refreshError);
+        userTokens.delete(userId);
+        return res.status(401).json({
+          success: false,
+          message: 'Sesión expirada. Por favor, autoriza el acceso a Google Calendar nuevamente.'
+        });
+      }
+    }
+
+    oauth2Client.setCredentials(tokens);
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+    // Convertir días de la semana a formato RRULE (0=Domingo, 1=Lunes, ..., 6=Sábado)
+    const dayMap = {
+      0: 'SU', // Domingo
+      1: 'MO', // Lunes
+      2: 'TU', // Martes
+      3: 'WE', // Miércoles
+      4: 'TH', // Jueves
+      5: 'FR', // Viernes
+      6: 'SA'  // Sábado
+    };
+
+    const rruleDays = daysOfWeek.map(day => dayMap[day]).join(',');
+
+    // Parsear hora (formato HH:MM)
+    const [hours, minutes] = time.split(':').map(Number);
+    if (isNaN(hours) || isNaN(minutes) || hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+      return res.status(400).json({
+        success: false,
+        message: 'Formato de hora inválido. Use HH:MM (24 horas).'
+      });
+    }
+
+    // Crear fecha de inicio (próxima ocurrencia de los días seleccionados)
+    const now = new Date();
+    const today = now.getDay(); // 0 = Domingo, 1 = Lunes, ..., 6 = Sábado
+    const selectedDays = daysOfWeek.sort((a, b) => a - b);
+    
+    console.log('📅 Fecha actual:', now.toISOString(), 'Día de hoy:', today, 'Timezone:', timezone);
+    console.log('📅 Días seleccionados:', selectedDays, 'Hora:', time);
+    
+    // Crear fecha base para hoy con la hora seleccionada
+    const startDate = new Date(now);
+    startDate.setHours(hours, minutes, 0, 0);
+    startDate.setSeconds(0, 0);
+    startDate.setMilliseconds(0);
+    
+    let daysToAdd = 0;
+    
+    // Verificar si hoy es uno de los días seleccionados
+    const isTodaySelected = selectedDays.includes(today);
+    
+    if (isTodaySelected) {
+      // Si hoy está seleccionado y la hora aún no ha pasado, usar hoy
+      if (startDate > now) {
+        daysToAdd = 0;
+        console.log('📅 Hoy está seleccionado y la hora aún no ha pasado, usando hoy');
+      } else {
+        // La hora ya pasó, buscar el próximo día
+        for (const day of selectedDays) {
+          if (day > today) {
+            daysToAdd = day - today;
+            break;
+          }
+        }
+        // Si no hay día después de hoy, usar el primer día de la próxima semana
+        if (daysToAdd === 0) {
+          daysToAdd = (7 - today) + selectedDays[0];
+          console.log('📅 La hora ya pasó hoy, usando el primer día de la próxima semana');
+        }
+      }
+    } else {
+      // Hoy no está seleccionado, buscar el próximo día
+      for (const day of selectedDays) {
+        if (day > today) {
+          daysToAdd = day - today;
+          break;
+        }
+      }
+      // Si no hay día después de hoy, usar el primer día de la próxima semana
+      if (daysToAdd === 0) {
+        daysToAdd = (7 - today) + selectedDays[0];
+        console.log('📅 No hay día esta semana, usando el primer día de la próxima semana');
+      }
+    }
+    
+    // Aplicar el desplazamiento de días
+    startDate.setDate(startDate.getDate() + daysToAdd);
+    startDate.setHours(hours, minutes, 0, 0);
+    startDate.setSeconds(0, 0);
+    startDate.setMilliseconds(0);
+    
+    // Asegurar que la fecha no esté en el pasado
+    if (startDate <= now) {
+      console.warn('⚠️ La fecha calculada está en el pasado, agregando una semana más');
+      startDate.setDate(startDate.getDate() + 7);
+    }
+    
+    console.log('📅 Fecha final calculada:', startDate.toISOString(), 'Días agregados:', daysToAdd);
+    console.log('📅 Fecha en formato local:', startDate.toLocaleString('es-ES', { timeZone: timezone }));
+
+    // Fecha de fin (1 hora después)
+    const endDate = new Date(startDate);
+    endDate.setHours(endDate.getHours() + 1);
+
+    // Obtener información del calendario antes de crear el evento
+    let calendarInfo = null;
+    try {
+      const calendarList = await calendar.calendarList.list();
+      const primaryCal = calendarList.data.items?.find(c => c.primary) || calendarList.data.items?.[0];
+      calendarInfo = {
+        id: primaryCal?.id,
+        summary: primaryCal?.summary,
+        timeZone: primaryCal?.timeZone,
+        accessRole: primaryCal?.accessRole
+      };
+      console.log('📅 Información del calendario principal:', calendarInfo);
+    } catch (calError) {
+      console.warn('⚠️ No se pudo obtener información del calendario:', calError.message);
+    }
+
+    // Crear evento recurrente
+    const event = {
+      summary: `📚 Repaso de Pills: ${documentName}`,
+      description: `Recordatorio para repasar las Flash Pills del documento "${documentName}".\n\nDocumento ID: ${documentId}\n\nEste evento se repetirá semanalmente en los días seleccionados.`,
+      start: {
+        dateTime: startDate.toISOString(),
+        timeZone: timezone
+      },
+      end: {
+        dateTime: endDate.toISOString(),
+        timeZone: timezone
+      },
+      recurrence: [
+        durationWeeks > 0 
+          ? `RRULE:FREQ=WEEKLY;BYDAY=${rruleDays};WKST=SU;COUNT=${durationWeeks}`
+          : `RRULE:FREQ=WEEKLY;BYDAY=${rruleDays};WKST=SU`
+      ],
+      reminders: {
+        useDefault: false,
+        overrides: [
+          { method: 'email', minutes: 24 * 60 }, // 1 día antes por email
+          { method: 'popup', minutes: 15 } // 15 minutos antes por popup
+        ]
+      },
+      colorId: '10', // Color verde para eventos de estudio
+      visibility: 'default',
+      transparency: 'opaque'
+    };
+    
+    console.log('📅 Evento a crear:', {
+      summary: event.summary,
+      start: event.start.dateTime,
+      end: event.end.dateTime,
+      timeZone: event.start.timeZone,
+      recurrence: event.recurrence,
+      rruleDays: rruleDays
+    });
+
+    console.log('📅 Creando evento en Google Calendar:', {
+      userId,
+      documentName,
+      daysOfWeek,
+      time,
+      startDate: startDate.toISOString(),
+      rruleDays,
+      calendarId: 'primary'
+    });
+
+    try {
+      console.log('🔄 Insertando evento en Google Calendar...');
+      console.log('📋 Detalles del evento:', JSON.stringify({
+        summary: event.summary,
+        start: event.start,
+        end: event.end,
+        recurrence: event.recurrence
+      }, null, 2));
+      
+      // Crear el evento usando events.insert() como se especifica en la documentación
+      const response = await calendar.events.insert({
+        calendarId: 'primary', // Calendario principal del usuario
+        resource: event,
+        sendUpdates: 'none' // No enviar notificaciones ya que no hay asistentes
+      });
+      
+      console.log('📡 Respuesta completa de events.insert():', {
+        status: response.status,
+        statusText: response.statusText,
+        hasData: !!response.data
+      });
+
+      const calendarId = response.data.organizer?.email || userId || 'primary';
+      
+      console.log('✅ Evento insertado en Google Calendar API:', {
+        eventId: response.data.id,
+        eventLink: response.data.htmlLink,
+        startTime: response.data.start.dateTime,
+        summary: response.data.summary,
+        calendarId: calendarId,
+        organizerEmail: response.data.organizer?.email,
+        creatorEmail: response.data.creator?.email,
+        status: response.data.status,
+        created: response.data.created,
+        updated: response.data.updated,
+        recurrence: response.data.recurrence,
+        attendees: response.data.attendees?.length || 0,
+        visibility: response.data.visibility,
+        transparency: response.data.transparency
+      });
+
+      // Verificar que el evento realmente existe haciendo una consulta inmediata
+      try {
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Esperar 1 segundo
+        const verifyEvent = await calendar.events.get({
+          calendarId: 'primary',
+          eventId: response.data.id
+        });
+        console.log('✅ Evento verificado exitosamente en Google Calendar:', {
+          verified: true,
+          eventId: verifyEvent.data.id,
+          summary: verifyEvent.data.summary,
+          status: verifyEvent.data.status,
+          start: verifyEvent.data.start.dateTime,
+          recurrence: verifyEvent.data.recurrence
+        });
+        
+        // También listar eventos próximos para confirmar
+        try {
+          const listResponse = await calendar.events.list({
+            calendarId: 'primary',
+            timeMin: new Date().toISOString(),
+            maxResults: 50,
+            singleEvents: false
+          });
+          
+          console.log('📋 Total de eventos encontrados en el calendario:', listResponse.data.items?.length || 0);
+          
+          const matchingEvents = listResponse.data.items?.filter(e => 
+            e.summary?.includes('Repaso de Pills') || e.id === response.data.id
+          ) || [];
+          
+          console.log('📋 Eventos de repaso encontrados en el calendario:', matchingEvents.length);
+          if (matchingEvents.length > 0) {
+            console.log('📅 Calendario usado: primary (', calendarId, ')');
+            matchingEvents.forEach(e => {
+              console.log('  ✅', e.summary, '| ID:', e.id, '| Start:', e.start?.dateTime || e.start?.date, '| Status:', e.status, '| Organizer:', e.organizer?.email);
+            });
+            // Mostrar el evento recién creado específicamente
+            const newlyCreated = matchingEvents.find(e => e.id === response.data.id);
+            if (newlyCreated) {
+              console.log('🎯 Evento recién creado encontrado en la lista:', {
+                id: newlyCreated.id,
+                summary: newlyCreated.summary,
+                start: newlyCreated.start?.dateTime || newlyCreated.start?.date,
+                recurrence: newlyCreated.recurrence,
+                organizer: newlyCreated.organizer?.email,
+                calendarId: 'primary'
+              });
+            } else {
+              console.warn('⚠️ El evento recién creado (ID:', response.data.id, ') no aparece en la lista de eventos de repaso');
+            }
+          } else {
+            console.warn('⚠️ No se encontraron eventos de repaso en la lista, pero el evento fue creado con ID:', response.data.id);
+            console.log('📋 Primeros 5 eventos en el calendario:');
+            listResponse.data.items?.slice(0, 5).forEach(e => {
+              console.log('  -', e.summary || '(sin título)', '| Start:', e.start?.dateTime || e.start?.date, '| Organizer:', e.organizer?.email);
+            });
+          }
+        } catch (listError) {
+          console.error('⚠️ Error al listar eventos:', listError.message);
+        }
+      } catch (verifyError) {
+        console.error('❌ Error al verificar evento:', {
+          message: verifyError.message,
+          code: verifyError.code,
+          details: verifyError.response?.data
+        });
+      }
+
+      res.json({
+        success: true,
+        message: 'Evento creado exitosamente en Google Calendar',
+        eventId: response.data.id,
+        eventLink: response.data.htmlLink,
+        calendarLink: `https://calendar.google.com/calendar/u/0/r`,
+        startTime: response.data.start.dateTime,
+        calendarId: calendarId,
+        calendarSummary: calendarInfo?.summary || 'Calendario principal',
+        eventSummary: response.data.summary,
+        recurrence: response.data.recurrence,
+        // Información adicional para debugging
+        debug: {
+          organizerEmail: response.data.organizer?.email,
+          creatorEmail: response.data.creator?.email,
+          status: response.data.status,
+          visibility: response.data.visibility,
+          calendarInfo: calendarInfo
+        }
+      });
+    } catch (calendarError) {
+      console.error('❌ Error al insertar evento en Google Calendar:', {
+        error: calendarError.message,
+        code: calendarError.code,
+        userId: userId,
+        hasTokens: !!tokens
+      });
+      throw calendarError; // Re-lanzar para que se maneje en el catch externo
+    }
+  } catch (error) {
+    console.error('❌ Error al crear evento en Google Calendar:', {
+      error: error.message,
+      code: error.code,
+      stack: error.stack
+    });
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Error al crear el evento en Google Calendar',
+      details: error.code || 'Unknown error'
+    });
+  }
+});
+
+// Endpoint de prueba para listar eventos de repaso
+app.get('/api/v1/calendar/list-events/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const tokens = userTokens.get(userId);
+    
+    if (!tokens) {
+      return res.status(401).json({
+        success: false,
+        message: 'Usuario no autenticado'
+      });
+    }
+
+    oauth2Client.setCredentials(tokens);
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+    const listResponse = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: new Date().toISOString(),
+      maxResults: 100,
+      singleEvents: false,
+      q: 'Repaso de Pills'
+    });
+
+    const allEvents = listResponse.data.items || [];
+    const repasoEvents = allEvents.filter(e => e.summary?.includes('Repaso de Pills'));
+
+    res.json({
+      success: true,
+      totalEvents: allEvents.length,
+      repasoEvents: repasoEvents.length,
+      events: repasoEvents.map(e => ({
+        id: e.id,
+        summary: e.summary,
+        start: e.start?.dateTime || e.start?.date,
+        status: e.status,
+        recurrence: e.recurrence
+      }))
+    });
+  } catch (error) {
+    console.error('Error al listar eventos:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
+// Verificar si el usuario está autenticado
+app.get('/api/v1/calendar/check-auth/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const tokens = userTokens.get(userId);
+    
+    if (!tokens) {
+      return res.json({ success: false, authenticated: false });
+    }
+
+    // Verificar si el token es válido
+    oauth2Client.setCredentials(tokens);
+    try {
+      const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+      await calendar.calendarList.list({ maxResults: 1 });
+      res.json({ success: true, authenticated: true });
+    } catch (error) {
+      // Token inválido o expirado
+      userTokens.delete(userId);
+      res.json({ success: false, authenticated: false });
+    }
+  } catch (error) {
+    console.error('Error al verificar autenticación:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
 });
 
 // ✅ Manejo de rutas no encontradas
