@@ -940,7 +940,7 @@ app.get('/api/v1/documents/:id/text', (req, res) => {
 app.post('/api/v1/documents/:id/chat', async (req, res) => {
   try {
     const { id } = req.params;
-    const { message } = req.body;
+    const { message, conversationHistory = [] } = req.body;
     const document = documentsStore.get(id);
 
     if (!document) {
@@ -957,8 +957,65 @@ app.post('/api/v1/documents/:id/chat', async (req, res) => {
       });
     }
 
-    // Simular respuesta del asistente (en producción usar IA real)
-    const response = `Basándome en el documento "${document.filename}", puedo decirte que: ${message.toLowerCase().includes('qué') || message.toLowerCase().includes('que') ? 'El documento contiene información relevante sobre el tema que mencionas.' : 'El documento aborda varios aspectos importantes relacionados con tu pregunta.'} [Respuesta generada automáticamente]`;
+    const text = document.text || '';
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'El documento no tiene texto extraído'
+      });
+    }
+
+    // Usar Gemini Pro para generar respuesta contextual
+    let response = '';
+    
+    if (geminiClient) {
+      try {
+        // Preparar el contexto del documento (limitar a 100,000 caracteres)
+        const textForGemini = text.length > 100000 ? text.substring(0, 100000) + '...' : text;
+        
+        // Construir el historial de conversación para contexto
+        let conversationContext = '';
+        if (conversationHistory && conversationHistory.length > 0) {
+          conversationContext = '\n\nHistorial de conversación:\n';
+          conversationHistory.slice(-5).forEach((msg, idx) => {
+            conversationContext += `${msg.role === 'user' ? 'Usuario' : 'Asistente'}: ${msg.content}\n`;
+          });
+        }
+        
+        const prompt = `Eres un asistente experto que ayuda a los usuarios a entender documentos. 
+        
+Documento: "${document.filename}"
+Contenido del documento:
+${textForGemini}
+${conversationContext}
+
+Instrucciones:
+- Responde de manera natural y conversacional en español
+- Basa tus respuestas únicamente en el contenido del documento proporcionado
+- Si la pregunta no está relacionada con el documento, indícalo amablemente
+- Sé conciso pero informativo
+- Usa un tono profesional pero amigable
+
+Pregunta del usuario: ${message}
+
+Respuesta:`;
+
+        const geminiResponse = await generateWithGemini(prompt, 2000, 60000);
+        if (geminiResponse) {
+          response = geminiResponse.trim();
+          console.log('✅ Respuesta generada con Gemini Pro');
+        } else {
+          throw new Error('Gemini no generó respuesta');
+        }
+      } catch (error) {
+        console.error('Error al generar con Gemini Pro, usando fallback:', error.message);
+        // Fallback simple
+        response = `Basándome en el documento "${document.filename}", puedo ayudarte. Sin embargo, hubo un problema al procesar tu pregunta con el modelo avanzado. Por favor, intenta reformular tu pregunta.`;
+      }
+    } else {
+      // Fallback si Gemini no está configurado
+      response = `Basándome en el documento "${document.filename}", puedo ayudarte. Sin embargo, el asistente avanzado no está disponible en este momento. Por favor, intenta más tarde.`;
+    }
 
     res.json({
       success: true,
@@ -1005,7 +1062,7 @@ app.post('/api/v1/chat', async (req, res) => {
 // ✅ Endpoint TTS: Generar audio desde texto usando Gemini-TTS
 app.post('/api/v1/tts/speak', async (req, res) => {
   try {
-    const { text, lang = 'es', voiceDescription, voiceType, documentId } = req.body; // Aceptar ambos para compatibilidad
+    const { text, lang = 'es', voiceDescription, voiceType, voiceStyle, documentId } = req.body; // Aceptar voiceStyle y voiceDescription
 
     if (!text || text.trim().length === 0) {
       return res.status(400).json({
@@ -1017,14 +1074,20 @@ app.post('/api/v1/tts/speak', async (req, res) => {
     // Limitar el texto a 5000 caracteres por solicitud
     const textToConvert = text.substring(0, 5000);
     
-    // Usar voiceType o 'femenina' por defecto
+    // Priorizar voiceStyle y voiceDescription sobre voiceType (para compatibilidad)
     const finalVoiceType = voiceType || 'femenina';
+    const finalVoiceStyle = voiceStyle || null;
+    const finalVoiceDescription = voiceDescription || null;
     
-    // Generar hash único para el cache basado en: texto + voiceType + lang
+    // Generar hash único para el cache basado en: texto + voiceStyle/voiceType + lang + voiceDescription
     // Esto permite reutilizar el audio si el texto y la voz no cambian
+    const cacheKeyInput = finalVoiceStyle 
+      ? `${textToConvert}|${finalVoiceStyle}|${lang}|${finalVoiceDescription || ''}`
+      : `${textToConvert}|${finalVoiceType}|${lang}`;
+    
     const cacheKey = crypto
       .createHash('sha256')
-      .update(`${textToConvert}|${finalVoiceType}|${lang}`)
+      .update(cacheKeyInput)
       .digest('hex');
     
     // Directorio para cache de audio
@@ -1038,7 +1101,8 @@ app.post('/api/v1/tts/speak', async (req, res) => {
     
     // Verificar si el audio ya existe en cache
     if (fs.existsSync(cachedAudioPath)) {
-      console.log(`✅ Audio encontrado en cache: ${cacheKey.substring(0, 16)}... (voz: ${finalVoiceType})`);
+      const styleInfo = finalVoiceStyle ? `estilo: ${finalVoiceStyle}` : `voz: ${finalVoiceType}`;
+      console.log(`✅ Audio encontrado en cache: ${cacheKey.substring(0, 16)}... (${styleInfo})`);
       
       const audioBuffer = fs.readFileSync(cachedAudioPath);
       
@@ -1050,7 +1114,13 @@ app.post('/api/v1/tts/speak', async (req, res) => {
       return;
     }
     
-    console.log(`🔄 Generando nuevo audio (no encontrado en cache): ${cacheKey.substring(0, 16)}... (voz: ${finalVoiceType})`);
+    const styleInfo = finalVoiceStyle ? `estilo: ${finalVoiceStyle}` : `voz: ${finalVoiceType}`;
+    console.log(`🔄 Generando nuevo audio (no encontrado en cache): ${cacheKey.substring(0, 16)}... (${styleInfo})`);
+    
+    // Si hay voiceDescription, usarlo para generar un prompt más detallado para Google Cloud TTS
+    // Google Cloud TTS no soporta directamente descripciones de voz personalizadas,
+    // pero podemos usar la descripción para seleccionar parámetros de audio más apropiados
+    const useCustomDescription = finalVoiceDescription && finalVoiceDescription.trim().length > 0;
     
     // Prioridad: 1) Google Cloud Text-to-Speech, 2) gTTS (fallback)
     // Las credenciales ADC se buscan automáticamente en ~/.config/gcloud/application_default_credentials.json
@@ -1065,17 +1135,22 @@ app.post('/api/v1/tts/speak', async (req, res) => {
         const { TextToSpeechClient } = require('@google-cloud/text-to-speech');
         const client = new TextToSpeechClient();
         
-        // Mapeo de voces Google Cloud Text-to-Speech según tipo (masculina/femenina) e idioma
+        // Mapeo de voces Google Cloud Text-to-Speech según estilo o tipo
         // Usando modelo Gemini-TTS (gemini-2.5-flash-tts) para voces más naturales
-        // Las voces Gemini-TTS requieren que el modelo se especifique en el request
         const voiceMap = {
           'es': {
             'masculina': 'Kore',    // Voz masculina en español
-            'femenina': 'Callirrhoe' // Voz femenina en español
+            'femenina': 'Callirrhoe', // Voz femenina en español
+            'profesor': 'Kore',     // Profesor estricto - voz masculina autoritaria
+            'podcast': 'Kore',      // Podcast animador - voz masculina dinámica
+            'cuentos': 'Callirrhoe'  // Cuentos para dormir - voz femenina suave
           },
           'en': {
             'masculina': 'Orus',
-            'femenina': 'Charon'
+            'femenina': 'Charon',
+            'profesor': 'Orus',
+            'podcast': 'Orus',
+            'cuentos': 'Charon'
           }
         };
         
@@ -1085,8 +1160,32 @@ app.post('/api/v1/tts/speak', async (req, res) => {
           normalizedLang = 'es'; // Fallback a español
         }
         
-        const voiceName = voiceMap[normalizedLang]?.[finalVoiceType] || voiceMap[normalizedLang]?.['femenina'];
+        // Determinar qué voz usar: priorizar voiceStyle, luego voiceType
+        const voiceKey = finalVoiceStyle || finalVoiceType;
+        const voiceName = voiceMap[normalizedLang]?.[voiceKey] || voiceMap[normalizedLang]?.['femenina'];
         const languageCode = normalizedLang === 'es' ? 'es-ES' : `${normalizedLang}-US`;
+        
+        // Ajustar parámetros de audio según el estilo de voz
+        let speakingRate = 1.0;
+        let pitch = 0.0;
+        let volumeGainDb = 0.0;
+        
+        if (finalVoiceStyle === 'podcast') {
+          // Podcast animador: ritmo variado, tono muy expresivo y extrovertido
+          speakingRate = 1.15;
+          pitch = 4.0; // Pitch mucho más alto para sonar más extrovertido
+          volumeGainDb = 2.0; // Más volumen
+        } else if (finalVoiceStyle === 'cuentos') {
+          // Cuentos para dormir: ritmo lento, tono suave
+          speakingRate = 0.85;
+          pitch = -2.0;
+          volumeGainDb = -1.0;
+        } else if (finalVoiceStyle === 'profesor') {
+          // Profesor estricto: ritmo moderado, tono claro y enfático
+          speakingRate = 1.0;
+          pitch = 1.0;
+          volumeGainDb = 0.5;
+        }
         
         // Usar Google Cloud Text-to-Speech con el modelo gemini-2.5-flash-tts
         // Para voces Gemini-TTS, el modelo DEBE estar dentro del objeto voice
@@ -1095,17 +1194,18 @@ app.post('/api/v1/tts/speak', async (req, res) => {
           voice: {
             languageCode: languageCode,
             name: voiceName,
-            model: 'gemini-2.5-flash-tts' // Modelo Gemini-TTS requerido para voces Kore y Callirrhoe (debe estar aquí)
+            model: 'gemini-2.5-flash-tts' // Modelo Gemini-TTS requerido para voces Kore y Callirrhoe
           },
           audioConfig: {
             audioEncoding: 'MP3',
-            speakingRate: 1.0,
-            pitch: 0.0, // Pitch neutral, se puede ajustar
-            volumeGainDb: 0.0
+            speakingRate: speakingRate,
+            pitch: pitch,
+            volumeGainDb: volumeGainDb
           }
         };
         
-        console.log(`🔍 Google Cloud TTS Request: voice=${voiceName}, lang=${languageCode}, model=gemini-2.5-flash-tts, textLength=${textToConvert.length}`);
+        const styleInfo2 = finalVoiceStyle ? `estilo=${finalVoiceStyle}` : `tipo=${finalVoiceType}`;
+        console.log(`🔍 Google Cloud TTS Request: voice=${voiceName}, lang=${languageCode}, model=gemini-2.5-flash-tts, ${styleInfo2}, rate=${speakingRate}, pitch=${pitch}, textLength=${textToConvert.length}`);
         
         let response;
         try {
@@ -1149,7 +1249,8 @@ app.post('/api/v1/tts/speak', async (req, res) => {
         
         const audioBuffer = Buffer.from(response.audioContent);
         
-        console.log(`✅ Audio generado con Google Cloud Text-to-Speech: ${audioBuffer.length} bytes, voz: ${voiceName} (${finalVoiceType})`);
+        const styleInfo3 = finalVoiceStyle ? `estilo: ${finalVoiceStyle}` : `voz: ${finalVoiceType}`;
+        console.log(`✅ Audio generado con Google Cloud Text-to-Speech: ${audioBuffer.length} bytes, ${styleInfo3} (${voiceName})`);
         
         // Guardar audio en cache para reutilización
         fs.writeFileSync(cachedAudioPath, audioBuffer);
