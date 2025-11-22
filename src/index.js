@@ -7,9 +7,78 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const pdfParse = require('pdf-parse');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ✅ Configuración de Gemini Pro
+let geminiClient = null;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyBYoxKvfI_ThVr8wO8Sb9dTeIAT4eECJJE';
+if (GEMINI_API_KEY) {
+  try {
+    geminiClient = new GoogleGenerativeAI(GEMINI_API_KEY);
+    console.log('✅ Gemini Pro configurado correctamente');
+  } catch (error) {
+    console.error('⚠️ Error al configurar Gemini Pro:', error.message);
+  }
+} else {
+  console.log('ℹ️ GEMINI_API_KEY no configurada. Las pills se generarán con lógica simple.');
+}
+
+// ✅ Función helper para generar contenido con Gemini Pro con timeout
+async function generateWithGemini(prompt, maxTokens = 2000, timeoutMs = 30000) {
+  if (!geminiClient) {
+    return null; // Retornar null si Gemini no está configurado
+  }
+
+  // Crear una promesa con timeout
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error('Timeout: La generación con Gemini tardó demasiado')), timeoutMs);
+  });
+
+  const generatePromise = async () => {
+    try {
+      console.log(`🔄 Iniciando generación con Gemini (timeout: ${timeoutMs}ms)...`);
+      const startTime = Date.now();
+      
+      // Usar el modelo gemini-2.5-flash (más rápido y eficiente)
+      const model = geminiClient.getGenerativeModel({ model: 'gemini-2.5-flash' });
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      const text = response.text();
+      
+      const elapsedTime = Date.now() - startTime;
+      console.log(`✅ Gemini respondió en ${elapsedTime}ms`);
+      
+      return text;
+    } catch (error) {
+      console.error('Error al generar con Gemini Pro:', error.message);
+      // Si falla con gemini-2.5-flash, intentar con gemini-pro como fallback
+      try {
+        console.log('⚠️ Intentando con gemini-pro como fallback...');
+        const fallbackModel = geminiClient.getGenerativeModel({ model: 'gemini-pro' });
+        const result = await fallbackModel.generateContent(prompt);
+        const response = await result.response;
+        return response.text();
+      } catch (fallbackError) {
+        console.error('Error con fallback gemini-pro:', fallbackError.message);
+        throw fallbackError;
+      }
+    }
+  };
+
+  try {
+    // Race entre la generación y el timeout
+    return await Promise.race([generatePromise(), timeoutPromise]);
+  } catch (error) {
+    if (error.message.includes('Timeout')) {
+      console.error(`⏱️ Timeout después de ${timeoutMs}ms`);
+    }
+    return null;
+  }
+}
+
 
 // Middlewares
 app.use(cors());
@@ -425,6 +494,94 @@ app.post('/api/v1/documents/:id/summary', async (req, res) => {
   }
 });
 
+// ✅ Endpoint para generar Micro Summary
+app.post('/api/v1/documents/:id/micro-summary', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const document = documentsStore.get(id);
+
+    if (!document) {
+      return res.status(404).json({
+        success: false,
+        message: 'Documento no encontrado'
+      });
+    }
+
+    // Verificar si ya existe un micro summary (evitar regenerar)
+    if (document.pills && document.pills.microSummary) {
+      console.log('✅ Micro summary ya existe, retornando desde cache');
+      return res.json({
+        success: true,
+        microSummary: document.pills.microSummary,
+        cached: true
+      });
+    }
+
+    const text = document.text || '';
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'El documento no tiene texto extraído'
+      });
+    }
+
+    let title = document.filename.replace('.pdf', '').replace(/_/g, ' ') || 'Resumen del documento';
+    let description = '';
+
+    // Intentar usar Gemini Pro para generar un resumen inteligente
+    if (geminiClient) {
+      try {
+        // Gemini puede manejar hasta ~30,000 tokens (aproximadamente 120,000 caracteres)
+        // Pasamos el texto completo del PDF para mejor contexto
+        const textForGemini = text.length > 100000 ? text.substring(0, 100000) + '...' : text;
+        
+        const prompt = `Genera un micro resumen conciso (máximo 200 palabras) del siguiente documento. El resumen debe ser claro, informativo y capturar los puntos principales.
+
+Documento completo:
+${textForGemini}`;
+
+        const geminiResponse = await generateWithGemini(prompt, 500);
+        if (geminiResponse) {
+          description = geminiResponse.trim();
+          console.log('✅ Micro summary generado con Gemini Pro');
+        }
+      } catch (error) {
+        console.error('Error al generar con Gemini Pro, usando fallback:', error.message);
+      }
+    }
+
+    // Fallback si Gemini no está disponible o falla
+    if (!description) {
+      const summaryLength = Math.min(300, text.length);
+      description = text.substring(0, summaryLength) + (text.length > summaryLength ? '...' : '');
+      console.log('ℹ️ Micro summary generado con lógica simple (fallback)');
+    }
+    
+    const microSummary = {
+      id: `micro-summary-${id}`,
+      title: title,
+      description: description,
+      documentId: id
+    };
+
+    // Guardar micro summary en el documento
+    if (!document.pills) document.pills = {};
+    document.pills.microSummary = microSummary;
+    documentsStore.set(id, document);
+
+    res.json({
+      success: true,
+      microSummary: microSummary
+    });
+  } catch (error) {
+    console.error('Error al generar micro summary:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Error al generar el micro summary'
+    });
+  }
+});
+
 // ✅ Endpoint para generar flashcards
 app.post('/api/v1/documents/:id/flashcards', async (req, res) => {
   try {
@@ -439,22 +596,93 @@ app.post('/api/v1/documents/:id/flashcards', async (req, res) => {
       });
     }
 
-    // Simular generación de flashcards (en producción usar IA real)
-    const flashcards = [];
-    const sentences = document.text.split('.').filter(s => s.trim().length > 20);
-    
-    for (let i = 0; i < Math.min(count, sentences.length); i++) {
-      const sentence = sentences[i].trim();
-      flashcards.push({
-        id: `flashcard-${i + 1}`,
-        question: `¿Qué información se menciona sobre: "${sentence.substring(0, 50)}..."?`,
-        answer: sentence,
-        documentId: id
+    // Verificar si ya existen flashcards (evitar regenerar)
+    if (document.pills && document.pills.flashcards && document.pills.flashcards.length > 0) {
+      console.log(`✅ ${document.pills.flashcards.length} flashcards ya existen, retornando desde cache`);
+      return res.json({
+        success: true,
+        flashcards: document.pills.flashcards,
+        count: document.pills.flashcards.length,
+        cached: true
       });
     }
 
+    const text = document.text || '';
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'El documento no tiene texto extraído'
+      });
+    }
+
+    let flashcards = [];
+
+    // Intentar usar Gemini Pro para generar flashcards inteligentes
+    if (geminiClient) {
+      try {
+        // Pasar el texto completo del PDF para mejor contexto
+        const textForGemini = text.length > 100000 ? text.substring(0, 100000) + '...' : text;
+        
+        const prompt = `Genera ${count} flashcards educativas basadas en el siguiente documento. Cada flashcard debe tener:
+1. Un título que sea una pregunta clara y concisa
+2. Una descripción que sea la respuesta detallada
+
+IMPORTANTE: Responde SOLO con un JSON array válido, sin texto adicional antes o después.
+
+Formato de respuesta (JSON array):
+[
+  {
+    "title": "Pregunta aquí",
+    "description": "Respuesta detallada aquí"
+  }
+]
+
+Documento completo:
+${textForGemini}`;
+
+        const geminiResponse = await generateWithGemini(prompt, 2000);
+        if (geminiResponse) {
+          try {
+            // Intentar parsear JSON (Gemini puede devolver texto con JSON)
+            const jsonMatch = geminiResponse.match(/\[[\s\S]*\]/);
+            if (jsonMatch) {
+              const parsed = JSON.parse(jsonMatch[0]);
+              flashcards = parsed.slice(0, count).map((fc, i) => ({
+                id: `flashcard-${i + 1}`,
+                title: fc.title || `Pregunta ${i + 1}`,
+                description: fc.description || '',
+                documentId: id
+              }));
+              console.log(`✅ ${flashcards.length} flashcards generadas con Gemini Pro`);
+            }
+          } catch (parseError) {
+            console.error('Error al parsear respuesta de Gemini:', parseError.message);
+          }
+        }
+      } catch (error) {
+        console.error('Error al generar con Gemini Pro, usando fallback:', error.message);
+      }
+    }
+
+    // Fallback si Gemini no está disponible o falla
+    if (flashcards.length === 0) {
+      const sentences = document.text.split('.').filter(s => s.trim().length > 20);
+      for (let i = 0; i < Math.min(count, sentences.length); i++) {
+        const sentence = sentences[i].trim();
+        const questionText = sentence.substring(0, 50);
+        flashcards.push({
+          id: `flashcard-${i + 1}`,
+          title: `¿Qué información se menciona sobre: "${questionText}..."?`,
+          description: sentence,
+          documentId: id
+        });
+      }
+      console.log(`ℹ️ ${flashcards.length} flashcards generadas con lógica simple (fallback)`);
+    }
+
     // Guardar flashcards en el documento
-    document.flashcards = flashcards;
+    if (!document.pills) document.pills = {};
+    document.pills.flashcards = flashcards;
     documentsStore.set(id, document);
 
     res.json({
@@ -467,6 +695,216 @@ app.post('/api/v1/documents/:id/flashcards', async (req, res) => {
     res.status(500).json({
       success: false,
       message: error.message || 'Error al generar las flashcards'
+    });
+  }
+});
+
+// ✅ Endpoint para generar Highlight Concepts
+app.post('/api/v1/documents/:id/highlight-concepts', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { count = 5 } = req.body;
+    const document = documentsStore.get(id);
+
+    if (!document) {
+      return res.status(404).json({
+        success: false,
+        message: 'Documento no encontrado'
+      });
+    }
+
+    // Verificar si ya existen conceptos destacados (evitar regenerar)
+    if (document.pills && document.pills.highlightConcepts && document.pills.highlightConcepts.length > 0) {
+      console.log(`✅ ${document.pills.highlightConcepts.length} conceptos destacados ya existen, retornando desde cache`);
+      return res.json({
+        success: true,
+        concepts: document.pills.highlightConcepts,
+        count: document.pills.highlightConcepts.length,
+        cached: true
+      });
+    }
+
+    const text = document.text || '';
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'El documento no tiene texto extraído'
+      });
+    }
+
+    let concepts = [];
+
+    // Intentar usar Gemini Pro para extraer conceptos clave
+    if (geminiClient) {
+      try {
+        // Pasar el texto completo del PDF para mejor contexto
+        const textForGemini = text.length > 100000 ? text.substring(0, 100000) + '...' : text;
+        
+        const prompt = `Extrae los ${count} conceptos más importantes del siguiente documento. Para cada concepto, proporciona:
+1. Un título corto y claro del concepto
+2. Una descripción breve que explique el concepto en el contexto del documento
+
+IMPORTANTE: Responde SOLO con un JSON array válido, sin texto adicional antes o después.
+
+Formato de respuesta (JSON array):
+[
+  {
+    "title": "Nombre del concepto",
+    "description": "Explicación del concepto en el contexto del documento"
+  }
+]
+
+Documento completo:
+${textForGemini}`;
+
+        const geminiResponse = await generateWithGemini(prompt, 2000);
+        if (geminiResponse) {
+          try {
+            // Intentar parsear JSON
+            const jsonMatch = geminiResponse.match(/\[[\s\S]*\]/);
+            if (jsonMatch) {
+              const parsed = JSON.parse(jsonMatch[0]);
+              concepts = parsed.slice(0, count).map((c, i) => ({
+                id: `concept-${i + 1}`,
+                title: c.title || `Concepto ${i + 1}`,
+                description: c.description || '',
+                documentId: id
+              }));
+              console.log(`✅ ${concepts.length} conceptos destacados generados con Gemini Pro`);
+            }
+          } catch (parseError) {
+            console.error('Error al parsear respuesta de Gemini:', parseError.message);
+          }
+        }
+      } catch (error) {
+        console.error('Error al generar con Gemini Pro, usando fallback:', error.message);
+      }
+    }
+
+    // Fallback si Gemini no está disponible o falla
+    if (concepts.length === 0) {
+      const sentences = text.split('.').filter(s => s.trim().length > 30);
+      const words = text.split(/\s+/).filter(w => w.length > 5);
+      const uniqueWords = [...new Set(words)].slice(0, count);
+      
+      for (let i = 0; i < Math.min(count, uniqueWords.length); i++) {
+        const concept = uniqueWords[i].replace(/[.,;:!?]/g, '');
+        const relatedSentence = sentences.find(s => s.includes(concept)) || sentences[i] || '';
+        
+        concepts.push({
+          id: `concept-${i + 1}`,
+          title: concept.charAt(0).toUpperCase() + concept.slice(1),
+          description: relatedSentence.trim().substring(0, 150) + (relatedSentence.length > 150 ? '...' : ''),
+          documentId: id
+        });
+      }
+      console.log(`ℹ️ ${concepts.length} conceptos destacados generados con lógica simple (fallback)`);
+    }
+
+    // Guardar conceptos en el documento
+    if (!document.pills) document.pills = {};
+    document.pills.highlightConcepts = concepts;
+    documentsStore.set(id, document);
+
+    res.json({
+      success: true,
+      concepts: concepts,
+      count: concepts.length
+    });
+  } catch (error) {
+    console.error('Error al generar conceptos destacados:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Error al generar los conceptos destacados'
+    });
+  }
+});
+
+// ✅ Endpoint para obtener todas las pills de un documento
+app.get('/api/v1/documents/:id/pills', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const document = documentsStore.get(id);
+
+    if (!document) {
+      return res.status(404).json({
+        success: false,
+        message: 'Documento no encontrado'
+      });
+    }
+
+    const pills = document.pills || {};
+
+    res.json({
+      success: true,
+      pills: {
+        microSummary: pills.microSummary || null,
+        flashcards: pills.flashcards || [],
+        highlightConcepts: pills.highlightConcepts || [],
+        savedPills: pills.savedPills || []
+      }
+    });
+  } catch (error) {
+    console.error('Error al obtener pills:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Error al obtener las pills'
+    });
+  }
+});
+
+// ✅ Endpoint para guardar una pill (Saved Pills)
+app.post('/api/v1/documents/:id/pills/save', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { pillId, title, description } = req.body;
+    const document = documentsStore.get(id);
+
+    if (!document) {
+      return res.status(404).json({
+        success: false,
+        message: 'Documento no encontrado'
+      });
+    }
+
+    if (!pillId || !title || !description) {
+      return res.status(400).json({
+        success: false,
+        message: 'pillId, title y description son requeridos'
+      });
+    }
+
+    // Guardar pill
+    if (!document.pills) document.pills = {};
+    if (!document.pills.savedPills) document.pills.savedPills = [];
+    
+    const savedPill = {
+      id: pillId,
+      title: title,
+      description: description,
+      documentId: id,
+      savedAt: new Date().toISOString()
+    };
+
+    // Evitar duplicados
+    const existingIndex = document.pills.savedPills.findIndex(p => p.id === pillId);
+    if (existingIndex >= 0) {
+      document.pills.savedPills[existingIndex] = savedPill;
+    } else {
+      document.pills.savedPills.push(savedPill);
+    }
+
+    documentsStore.set(id, document);
+
+    res.json({
+      success: true,
+      savedPill: savedPill
+    });
+  } catch (error) {
+    console.error('Error al guardar pill:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Error al guardar la pill'
     });
   }
 });
