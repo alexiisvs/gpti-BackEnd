@@ -1,3 +1,5 @@
 node_modules
 .env
 uploads/
+audio_cache/
+audio/

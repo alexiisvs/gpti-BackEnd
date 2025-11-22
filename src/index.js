@@ -5,6 +5,7 @@ const morgan = require('morgan');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const pdfParse = require('pdf-parse');
 
 const app = express();
@@ -262,6 +263,129 @@ app.get('/api/v1/documents/:id', (req, res) => {
   }
 });
 
+// ✅ Endpoint para eliminar documento por ID
+app.delete('/api/v1/documents/:id', (req, res) => {
+  try {
+    // Verificar autenticación básica
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        success: false,
+        message: 'No autorizado. Token requerido.'
+      });
+    }
+
+    const { id } = req.params;
+    const document = documentsStore.get(id);
+
+    if (!document) {
+      console.log(`⚠️ Documento ${id} no encontrado en memoria`);
+      return res.status(404).json({
+        success: false,
+        message: 'Documento no encontrado. El documento puede haber sido eliminado previamente o el servidor se reinició.'
+      });
+    }
+    
+    console.log(`🗑️ Eliminando documento ${id}: ${document.filename}`);
+
+    // Eliminar archivo PDF si existe
+    if (document.filepath && fs.existsSync(document.filepath)) {
+      try {
+        fs.unlinkSync(document.filepath);
+        console.log(`✅ Archivo PDF eliminado: ${document.filepath}`);
+      } catch (err) {
+        console.error(`Error al eliminar archivo PDF ${document.filepath}:`, err);
+      }
+    }
+
+    // Eliminar audios en cache asociados a este documento
+    // El hash se genera como: SHA256(texto|voiceType|lang)
+    // Necesitamos eliminar todos los audios relacionados con este texto, independientemente de la voz
+    const audioCacheDir = path.join(__dirname, '../audio_cache');
+    console.log(`🗑️ Iniciando eliminación de audios del cache para documento ${id}`);
+    console.log(`   Documento tiene texto: ${!!document.text}, longitud: ${document.text ? document.text.length : 0}`);
+    
+    if (fs.existsSync(audioCacheDir) && document.text) {
+      try {
+        const files = fs.readdirSync(audioCacheDir);
+        const textToSearch = document.text.substring(0, 5000);
+        console.log(`🔍 Buscando audios para texto de ${textToSearch.length} caracteres (documento ${id})`);
+        console.log(`   Primeros 100 caracteres del texto: "${textToSearch.substring(0, 100)}..."`);
+        
+        // Generar hashes para todas las combinaciones posibles de voz e idioma
+        const voiceTypes = ['femenina', 'masculina'];
+        const languages = ['es', 'en'];
+        const hashesToDelete = new Set();
+        
+        // Generar todos los posibles hashes para este texto
+        for (const voiceType of voiceTypes) {
+          for (const lang of languages) {
+            const hash = crypto
+              .createHash('sha256')
+              .update(`${textToSearch}|${voiceType}|${lang}`)
+              .digest('hex');
+            hashesToDelete.add(hash);
+            console.log(`🔍 Hash generado: ${hash} (voz: ${voiceType}, lang: ${lang})`);
+          }
+        }
+        
+        console.log(`📁 Archivos en cache: ${files.length}`);
+        
+        // Eliminar todos los archivos que coincidan con alguno de los hashes
+        let deletedCount = 0;
+        files.forEach(file => {
+          // El archivo tiene formato: {hash}.mp3
+          if (!file.endsWith('.mp3')) return;
+          
+          const fileHash = file.replace('.mp3', '');
+          if (hashesToDelete.has(fileHash)) {
+            const filePath = path.join(audioCacheDir, file);
+            try {
+              fs.unlinkSync(filePath);
+              console.log(`✅ Audio en cache eliminado: ${file}`);
+              deletedCount++;
+            } catch (err) {
+              console.error(`Error al eliminar audio ${file}:`, err);
+            }
+          } else {
+            console.log(`⏭️ Archivo ${file} no coincide con ningún hash generado`);
+          }
+        });
+        
+        if (deletedCount > 0) {
+          console.log(`🗑️ Eliminados ${deletedCount} archivo(s) de audio del cache para el documento ${id}`);
+        } else {
+          console.log(`⚠️ No se encontraron archivos de audio en cache para eliminar (documento ${id})`);
+          console.log(`   Hashes buscados: ${Array.from(hashesToDelete).map(h => h.substring(0, 16) + '...').join(', ')}`);
+          console.log(`   Archivos en cache: ${files.filter(f => f.endsWith('.mp3')).map(f => f.substring(0, 16) + '...').join(', ')}`);
+        }
+      } catch (err) {
+        console.error('Error al limpiar cache de audio:', err);
+      }
+    } else {
+      console.log(`⚠️ No se puede eliminar audios: cache dir existe=${fs.existsSync(audioCacheDir)}, documento tiene texto=${!!document.text}`);
+      if (!document.text) {
+        console.log(`   ⚠️ El documento no tiene texto en memoria. Esto puede pasar si el servidor se reinició.`);
+        console.log(`   💡 Sugerencia: Los audios del cache pueden quedar huérfanos. Considera limpiar el cache manualmente si es necesario.`);
+      }
+    }
+
+    // Eliminar del almacenamiento en memoria
+    documentsStore.delete(id);
+
+    res.json({
+      success: true,
+      message: 'Documento y sus archivos asociados eliminados exitosamente'
+    });
+  } catch (error) {
+    console.error('Error al eliminar documento:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Error al eliminar el documento'
+    });
+  }
+});
+
 // ✅ Endpoint para generar resumen automático
 app.post('/api/v1/documents/:id/summary', async (req, res) => {
   try {
@@ -440,10 +564,10 @@ app.post('/api/v1/chat', async (req, res) => {
   }
 });
 
-// ✅ Endpoint TTS: Generar audio desde texto usando gTTS
+// ✅ Endpoint TTS: Generar audio desde texto usando Gemini-TTS
 app.post('/api/v1/tts/speak', async (req, res) => {
   try {
-    const { text, lang = 'es' } = req.body;
+    const { text, lang = 'es', voiceDescription, voiceType, documentId } = req.body; // Aceptar ambos para compatibilidad
 
     if (!text || text.trim().length === 0) {
       return res.status(400).json({
@@ -452,27 +576,208 @@ app.post('/api/v1/tts/speak', async (req, res) => {
       });
     }
 
-    // Limitar el texto a 5000 caracteres por solicitud (límite de gTTS)
+    // Limitar el texto a 5000 caracteres por solicitud
     const textToConvert = text.substring(0, 5000);
     
+    // Usar voiceType o 'femenina' por defecto
+    const finalVoiceType = voiceType || 'femenina';
+    
+    // Generar hash único para el cache basado en: texto + voiceType + lang
+    // Esto permite reutilizar el audio si el texto y la voz no cambian
+    const cacheKey = crypto
+      .createHash('sha256')
+      .update(`${textToConvert}|${finalVoiceType}|${lang}`)
+      .digest('hex');
+    
+    // Directorio para cache de audio
+    const audioCacheDir = path.join(__dirname, '../audio_cache');
+    if (!fs.existsSync(audioCacheDir)) {
+      fs.mkdirSync(audioCacheDir, { recursive: true });
+    }
+    
+    // Ruta del archivo de audio en cache
+    const cachedAudioPath = path.join(audioCacheDir, `${cacheKey}.mp3`);
+    
+    // Verificar si el audio ya existe en cache
+    if (fs.existsSync(cachedAudioPath)) {
+      console.log(`✅ Audio encontrado en cache: ${cacheKey.substring(0, 16)}... (voz: ${finalVoiceType})`);
+      
+      const audioBuffer = fs.readFileSync(cachedAudioPath);
+      
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Content-Length', audioBuffer.length);
+      res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache por 1 año
+      
+      res.send(audioBuffer);
+      return;
+    }
+    
+    console.log(`🔄 Generando nuevo audio (no encontrado en cache): ${cacheKey.substring(0, 16)}... (voz: ${finalVoiceType})`);
+    
+    // Prioridad: 1) Google Cloud Text-to-Speech, 2) gTTS (fallback)
+    // Las credenciales ADC se buscan automáticamente en ~/.config/gcloud/application_default_credentials.json
+    // También se puede configurar GOOGLE_APPLICATION_CREDENTIALS o GOOGLE_CLOUD_PROJECT
+    const useGoogleTTS = process.env.GOOGLE_APPLICATION_CREDENTIALS || 
+                         process.env.GOOGLE_CLOUD_PROJECT || 
+                         fs.existsSync(path.join(require('os').homedir(), '.config/gcloud/application_default_credentials.json'));
+    
+    // Intentar usar Google Cloud Text-to-Speech primero
+    if (useGoogleTTS) {
+      try {
+        const { TextToSpeechClient } = require('@google-cloud/text-to-speech');
+        const client = new TextToSpeechClient();
+        
+        // Mapeo de voces Google Cloud Text-to-Speech según tipo (masculina/femenina) e idioma
+        // Usando modelo Gemini-TTS (gemini-2.5-flash-tts) para voces más naturales
+        // Las voces Gemini-TTS requieren que el modelo se especifique en el request
+        const voiceMap = {
+          'es': {
+            'masculina': 'Kore',    // Voz masculina en español
+            'femenina': 'Callirrhoe' // Voz femenina en español
+          },
+          'en': {
+            'masculina': 'Orus',
+            'femenina': 'Charon'
+          }
+        };
+        
+        // Normalizar código de idioma
+        let normalizedLang = lang.includes('-') ? lang.split('-')[0] : lang;
+        if (!voiceMap[normalizedLang]) {
+          normalizedLang = 'es'; // Fallback a español
+        }
+        
+        const voiceName = voiceMap[normalizedLang]?.[finalVoiceType] || voiceMap[normalizedLang]?.['femenina'];
+        const languageCode = normalizedLang === 'es' ? 'es-ES' : `${normalizedLang}-US`;
+        
+        // Usar Google Cloud Text-to-Speech con el modelo gemini-2.5-flash-tts
+        // Para voces Gemini-TTS, el modelo DEBE estar dentro del objeto voice
+        const request = {
+          input: { text: textToConvert },
+          voice: {
+            languageCode: languageCode,
+            name: voiceName,
+            model: 'gemini-2.5-flash-tts' // Modelo Gemini-TTS requerido para voces Kore y Callirrhoe (debe estar aquí)
+          },
+          audioConfig: {
+            audioEncoding: 'MP3',
+            speakingRate: 1.0,
+            pitch: 0.0, // Pitch neutral, se puede ajustar
+            volumeGainDb: 0.0
+          }
+        };
+        
+        console.log(`🔍 Google Cloud TTS Request: voice=${voiceName}, lang=${languageCode}, model=gemini-2.5-flash-tts, textLength=${textToConvert.length}`);
+        
+        let response;
+        try {
+          [response] = await client.synthesizeSpeech(request);
+        } catch (googleError) {
+          // Si falla con Gemini-TTS, intentar con voces estándar de Google Cloud TTS
+          if (googleError.message && googleError.message.includes('model')) {
+            console.log(`⚠️ Error con Gemini-TTS, intentando con voces estándar de Google Cloud TTS...`);
+            const standardVoiceMap = {
+              'es': {
+                'masculina': 'es-ES-Standard-B',    // Voz masculina estándar
+                'femenina': 'es-ES-Standard-C'       // Voz femenina estándar
+              },
+              'en': {
+                'masculina': 'en-US-Standard-B',
+                'femenina': 'en-US-Standard-C'
+              }
+            };
+            const standardVoiceName = standardVoiceMap[normalizedLang]?.[finalVoiceType] || standardVoiceMap[normalizedLang]?.['femenina'];
+            
+            const standardRequest = {
+              input: { text: textToConvert },
+              voice: {
+                languageCode: languageCode,
+                name: standardVoiceName
+              },
+              audioConfig: {
+                audioEncoding: 'MP3',
+                speakingRate: 1.0,
+                pitch: 0.0,
+                volumeGainDb: 0.0
+              }
+            };
+            
+            console.log(`🔍 Google Cloud TTS Request (estándar): voice=${standardVoiceName}, lang=${languageCode}, textLength=${textToConvert.length}`);
+            [response] = await client.synthesizeSpeech(standardRequest);
+          } else {
+            throw googleError;
+          }
+        }
+        
+        const audioBuffer = Buffer.from(response.audioContent);
+        
+        console.log(`✅ Audio generado con Google Cloud Text-to-Speech: ${audioBuffer.length} bytes, voz: ${voiceName} (${finalVoiceType})`);
+        
+        // Guardar audio en cache para reutilización
+        fs.writeFileSync(cachedAudioPath, audioBuffer);
+        console.log(`💾 Audio guardado en cache: ${cacheKey.substring(0, 16)}...`);
+        
+        // Configurar headers para streaming de audio
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Content-Length', audioBuffer.length);
+        res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache por 1 año
+        
+        // Enviar el audio
+        res.send(audioBuffer);
+        return;
+      } catch (googleError) {
+        console.error('⚠️ Error con Google Cloud Text-to-Speech, usando gTTS como fallback:', googleError.message);
+        console.error('Detalles del error:', googleError);
+        // Continuar con gTTS como fallback
+      }
+    } else {
+      console.log('ℹ️ Google Cloud Text-to-Speech no configurado, usando gTTS. Para usar Google Cloud TTS, configura GOOGLE_APPLICATION_CREDENTIALS o GOOGLE_CLOUD_PROJECT');
+    }
+    
+    // Fallback a gTTS si Google Cloud TTS no está disponible o falla
+    // Verificar si ya existe en cache (también para gTTS)
+    if (fs.existsSync(cachedAudioPath)) {
+      console.log(`✅ Audio encontrado en cache (gTTS): ${cacheKey.substring(0, 16)}... (voz: ${finalVoiceType})`);
+      
+      const audioBuffer = fs.readFileSync(cachedAudioPath);
+      
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Content-Length', audioBuffer.length);
+      res.setHeader('Cache-Control', 'public, max-age=31536000');
+      
+      res.send(audioBuffer);
+      return;
+    }
+    
     const gtts = require('gtts');
-    const path = require('path');
     const audioDir = path.join(__dirname, '../audio');
     
-    // Crear directorio de audio si no existe
+    // Crear directorio de audio temporal si no existe (para gTTS)
     if (!fs.existsSync(audioDir)) {
       fs.mkdirSync(audioDir, { recursive: true });
     }
     
-    // Generar nombre único para el archivo de audio
-    const audioId = `audio-${Date.now()}-${Math.round(Math.random() * 1E9)}`;
-    const audioPath = path.join(audioDir, `${audioId}.mp3`);
+    // Usar el mismo cache key para gTTS también
+    const tempAudioPath = path.join(audioDir, `${cacheKey}-temp.mp3`);
     
-    // Generar audio usando gTTS
-    const tts = new gtts(textToConvert, lang);
+    // Validar y normalizar el código de idioma
+    let normalizedLang = lang;
+    if (lang.includes('-')) {
+      normalizedLang = lang.split('-')[0];
+      console.log(`Código de idioma normalizado de '${lang}' a '${normalizedLang}'`);
+    }
+    
+    // Validar que el código sea válido
+    const validLangs = ['es', 'en', 'fr', 'de', 'it', 'pt', 'ru', 'ja', 'ko', 'zh', 'ar', 'hi'];
+    if (!validLangs.includes(normalizedLang)) {
+      console.warn(`Código de idioma '${normalizedLang}' no está en la lista de válidos, usando 'es' por defecto`);
+      normalizedLang = 'es';
+    }
+    
+    const tts = new gtts(textToConvert, normalizedLang);
     
     return new Promise((resolve, reject) => {
-      tts.save(audioPath, async (err) => {
+      tts.save(tempAudioPath, async (err) => {
         if (err) {
           console.error('Error al generar audio con gTTS:', err);
           return res.status(500).json({
@@ -482,7 +787,7 @@ app.post('/api/v1/tts/speak', async (req, res) => {
         }
         
         // Verificar que el archivo se creó correctamente
-        if (!fs.existsSync(audioPath)) {
+        if (!fs.existsSync(tempAudioPath)) {
           console.error('El archivo de audio no se creó');
           return res.status(500).json({
             success: false,
@@ -491,38 +796,47 @@ app.post('/api/v1/tts/speak', async (req, res) => {
         }
         
         try {
-          // Leer el archivo y enviarlo como respuesta
-          const audioBuffer = fs.readFileSync(audioPath);
+          // Leer el archivo y guardarlo en cache
+          const audioBuffer = fs.readFileSync(tempAudioPath);
           
           if (audioBuffer.length === 0) {
             console.error('El archivo de audio está vacío');
+            // Limpiar archivo temporal
+            if (fs.existsSync(tempAudioPath)) {
+              fs.unlinkSync(tempAudioPath);
+            }
             return res.status(500).json({
               success: false,
               message: 'Error: El archivo de audio está vacío'
             });
           }
           
-          console.log(`Audio generado exitosamente: ${audioBuffer.length} bytes`);
+          console.log(`✅ Audio generado exitosamente con gTTS: ${audioBuffer.length} bytes`);
+          
+          // Guardar en cache para reutilización
+          fs.writeFileSync(cachedAudioPath, audioBuffer);
+          console.log(`💾 Audio guardado en cache (gTTS): ${cacheKey.substring(0, 16)}...`);
+          
+          // Limpiar archivo temporal
+          if (fs.existsSync(tempAudioPath)) {
+            fs.unlinkSync(tempAudioPath);
+          }
           
           // Configurar headers para streaming de audio
           res.setHeader('Content-Type', 'audio/mpeg');
           res.setHeader('Content-Length', audioBuffer.length);
-          res.setHeader('Content-Disposition', `inline; filename="${audioId}.mp3"`);
-          res.setHeader('Cache-Control', 'no-cache');
+          res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache por 1 año
           
           // Enviar el audio
           res.send(audioBuffer);
           
-          // Eliminar el archivo después de enviarlo (opcional, para ahorrar espacio)
-          setTimeout(() => {
-            if (fs.existsSync(audioPath)) {
-              fs.unlinkSync(audioPath);
-            }
-          }, 60000); // Eliminar después de 1 minuto
-          
           resolve();
         } catch (readError) {
           console.error('Error al leer el archivo de audio:', readError);
+          // Limpiar archivo temporal en caso de error
+          if (fs.existsSync(tempAudioPath)) {
+            fs.unlinkSync(tempAudioPath);
+          }
           res.status(500).json({
             success: false,
             message: 'Error al leer el archivo de audio: ' + readError.message
